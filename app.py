@@ -37,7 +37,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Inquiry Arena", page_icon="🔎", layout="wide")
 
-APP_VERSION = "inquiry-arena v0.4"
+APP_VERSION = "inquiry-arena v0.4.1"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 AVATARS = ["🟦", "🟧", "🟩", "🟪", "🟥", "🟨", "⬛", "⬜"]
@@ -81,7 +81,15 @@ How it works:
 - Be honest: use only your own facts or facts already on the table. Never invent facts or IDs.
   Don't repeat an argument you have already made.
 
-Reply with ONLY one JSON object. Every reply contains "readings", "leaning" and one move.
+Reply with ONLY one flat JSON object. Every reply contains "readings", "leaning" and the fields of one
+move, all at the top level (do not nest the move inside another object). A complete example reply:
+{"readings": [{"turn": 2, "stance": "attack", "target": 1, "premises": "...", "assumption": "...",
+  "conclusion": "..."}], "leaning": "undecided", "move": "assert", "fact": "X1", "stance": "support",
+ "target": "A", "aim": "conclusion", "say": "...", "mine": {"premises": "...", "assumption": "...",
+ "conclusion": "..."}}
+
+The stance must match your conclusion: if your argument concludes that an answer (or an earlier argument)
+is wrong, its stance is "attack" on it, not "support".
 
 "readings": add a reading for every argument by others that you have not read yet, and revise any
 reading that has changed (for example after an explanation). List only new or changed readings:
@@ -217,6 +225,34 @@ def parse_json(text):
             except json.JSONDecodeError:
                 continue
     return None
+
+
+MOVE_NAMES = {"assert", "ask_stance", "stance?", "ask_argument", "show", "explain", "retract", "withdraw", "pass"}
+
+FORMAT_REMINDER = """
+
+YOUR PREVIOUS REPLY COULD NOT BE READ. Reply with ONE flat JSON object: the move's fields sit at the top
+level, next to "readings" and "leaning" (do not nest them inside "move"). For example:
+{"readings": [], "leaning": "undecided", "move": "assert", "fact": "X1", "stance": "support", "target": "A",
+ "aim": "conclusion", "say": "...", "mine": {"premises": "...", "assumption": "...", "conclusion": "..."}}"""
+
+
+def read_reply(raw):
+    """Parse an agent's reply. Accepts the flat format and the common nested variant
+    {"readings": ..., "leaning": ..., "move": {"move": "assert", ...}}. Returns (obj, move_name)."""
+    obj = parse_json(raw)
+    if not isinstance(obj, dict):
+        return None, ""
+    inner = obj.get("move")
+    if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+        inner = inner[0]
+    if isinstance(inner, dict):
+        merged = {k: v for k, v in obj.items() if k != "move"}
+        merged.update(inner)
+        merged["move"] = inner.get("move") or inner.get("type") or inner.get("action") or ""
+        obj = merged
+    name = obj.get("move") or obj.get("action") or obj.get("type") or ""
+    return obj, _s(name).lower()
 
 
 def _s(v):
@@ -572,6 +608,8 @@ class Referee:
                 return f"Turn {t['turn']} - {who} tried to withdraw turn {t['turn_requested']}, but {t['problem']}."
             r = f' "{t["say"]}"' if t["say"] else ""
             return f"Turn {t['turn']} - {who} withdraws turn {t['turn_requested']}.{r}"
+        if mv in ("unreadable", "error"):
+            return f"Turn {t['turn']} - {who} said nothing (no readable move)."
         return f"Turn {t['turn']} - {who} passes."
 
     def public_record(self):
@@ -776,11 +814,17 @@ class Referee:
             others = ", ".join(x for x in self.names if x != name)
             system = (RULES.replace("<<NAME>>", name).replace("<<ROLE>>", role)
                       .replace("<<N>>", str(n)).replace("<<OTHERS>>", others))
-            raw, err = self.ask(self.models[name], system, self.agent_prompt(agent),
-                                lambda: self.mock_agent(agent))
-            obj = parse_json(raw) if not err else None
-            mv = _s(obj.get("move")).lower() if obj else ""
+            prompt = self.agent_prompt(agent)
+            raw, err = self.ask(self.models[name], system, prompt, lambda: self.mock_agent(agent))
+            obj, mv = read_reply(raw) if not err else (None, "")
             entry = {"turn": turn, "agent": name, "model": self.models[name], "raw": raw, "error": err}
+            if not err and mv not in MOVE_NAMES:  # unreadable: ask once more, with the format spelled out
+                entry["raw_first_try"] = raw
+                raw, err = self.ask(self.models[name], system, prompt + FORMAT_REMINDER,
+                                    lambda: self.mock_agent(agent, retry=True))
+                obj2, mv = read_reply(raw) if not err else (None, "")
+                obj = obj2 if obj2 is not None else obj
+                entry.update(raw=raw, error=err, retried=True)
             entry["readings_update"] = self.update_readings(name, obj, turn)
             entry["leaning"] = self.update_leaning(name, obj, turn)
             was_asked = self.pending if (self.pending and self.pending["to"] == name) else None
@@ -804,16 +848,19 @@ class Referee:
                     next_name = owner  # the asked agent answers next
             elif mv in ("retract", "withdraw"):
                 self.do_retract(entry, obj)
+            elif mv == "pass":
+                entry.update(move="pass")
             else:
-                entry.update(move="pass", unparsed=(not err and mv != "pass"))
+                entry.update(move="unreadable" if not err else "error")
             if was_asked and not answered:
                 entry["ignored_question"] = True
             self.table.append(entry)
             on_turn(entry)
 
-            errors_in_row = errors_in_row + 1 if err else 0
-            if errors_in_row >= n:
-                return "stopped: every agent hit an API error in a row (check your key, credits or model names)"
+            errors_in_row = errors_in_row + 1 if entry["move"] in ("error", "unreadable") else 0
+            if errors_in_row >= 2 * n:
+                return "stopped: agents kept failing (API errors or unreadable replies; check key, credits, models)"
+            # only a real pass counts towards ending the dialogue
             passes_in_row = passes_in_row + 1 if entry["move"] == "pass" else 0
             if passes_in_row >= n and not self.pending:
                 return "everyone passed"
@@ -910,7 +957,7 @@ class Referee:
         return rows
 
     # -- fake players for testing without spending money
-    def mock_agent(self, agent):
+    def mock_agent(self, agent, retry=False):
         name = agent["name"]
         p = self.pending
         reads = []
@@ -922,6 +969,8 @@ class Referee:
                 reads.append({"turn": e["turn"], "stance": st_, "target": tgt, "premises": "(mock)",
                               "assumption": "(mock) what I think they assume", "conclusion": "(mock)"})
         base = {"readings": reads, "leaning": random.choice(self.letters + ["undecided"])}
+        if not retry and random.random() < 0.05:
+            return "I think we should look at the oxygen data."
         if p and p["to"] == name:
             e = self.entry_at(p["turn"])
             honest = random.random() < 0.8
@@ -944,9 +993,12 @@ class Referee:
                 tgt = random.choice(others)["turn"]
             else:
                 tgt = random.choice(self.letters)
-            return json.dumps({**base, "move": "assert", "fact": random.choice(unshared), "stance": st_,
-                               "target": tgt, "aim": "assumption", "say": "(mock) This matters.",
-                               "mine": {"premises": "(mock)", "assumption": "(mock)", "conclusion": "(mock)"}})
+            mv = {"move": "assert", "fact": random.choice(unshared), "stance": st_,
+                  "target": tgt, "aim": "assumption", "say": "(mock) This matters.",
+                  "mine": {"premises": "(mock)", "assumption": "(mock)", "conclusion": "(mock)"}}
+            if random.random() < 0.3:  # the nested format some models use
+                return json.dumps({**base, "move": mv})
+            return json.dumps({**base, **mv})
         return json.dumps({**base, "move": "pass"})
 
     def mock_judge(self):
@@ -1013,7 +1065,8 @@ class Referee:
             "repeated_arguments": sum(1 for e in asserts if e.get("repeat")),
             "invalid_citations": sum(1 for e in asserts if e["fact_status"] == "invalid"),
             "moves_with_problems": sum(1 for e in self.table if e.get("problem")),
-            "unparsed_replies": sum(1 for e in self.table if e.get("unparsed")),
+            "unreadable_replies": sum(1 for e in self.table if e["move"] == "unreadable"),
+            "retries": sum(1 for e in self.table if e.get("retried")),
             "api_errors": sum(1 for e in self.table if e.get("error")),
         }
 
@@ -1079,8 +1132,11 @@ def show_turn(entry, avatar, facts, reveal, table=None):
                 st.markdown(f"> {entry['say']}")
             if entry["problem"]:
                 st.caption(f":orange[Not withdrawn: {entry['problem']}]")
-        elif entry.get("unparsed"):
-            st.caption("Reply was not valid JSON, counted as a pass.")
+        elif mv == "unreadable":
+            st.caption(":red[The reply could not be read, even after one retry. Nothing was said; "
+                       "this does not count as a pass.]")
+        if entry.get("retried") and mv != "unreadable":
+            st.caption("First reply was unreadable; this is the retry.")
         if entry.get("ignored_question"):
             st.caption(":orange[Did not answer the question put to them.]")
         if who in reveal["readings"]:
