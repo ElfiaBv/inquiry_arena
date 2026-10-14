@@ -1,0 +1,46 @@
+{
+  "title": "Mill Pond fish kill (toy example)",
+  "question": "Why did the fish in Mill Pond die last week?",
+  "options": {
+    "A": "A chemical spill from the paint factory",
+    "B": "Low oxygen caused by an algae bloom",
+    "C": "A fish disease"
+  },
+  "answer": "B",
+  "public_facts": {
+    "P1": "Hundreds of dead fish were found floating in Mill Pond last Monday morning.",
+    "P2": "A paint factory sits on the north shore of Mill Pond."
+  },
+  "agents": [
+    {
+      "name": "Alice",
+      "role": "a local fisher",
+      "facts": {
+        "A1": "Two days before the fish died, the pond water turned bright green.",
+        "A2": "Only the large fish died; the small fish were still swimming normally.",
+        "A3": "The paint factory had a small leak three years ago, which was cleaned up."
+      }
+    },
+    {
+      "name": "Bob",
+      "role": "a water-lab technician",
+      "facts": {
+        "B1": "Water samples taken on Monday contained no paint chemicals.",
+        "B2": "Dissolved oxygen measured on Sunday night was 1 mg/L, far below the 5 mg/L most fish need.",
+        "B3": "Some fish diseases kill large fish before small ones."
+      }
+    },
+    {
+      "name": "Cara",
+      "role": "a fish vet",
+      "facts": {
+        "C1": "Autopsies on ten of the dead fish found no signs of infection or disease.",
+        "C2": "Heavy rain the week before washed fertiliser from nearby farms into the pond.",
+        "C3": "Algae blooms use up oxygen at night, when the algae stop photosynthesising."
+      }
+    }
+  ],
+  "key_facts": ["A1", "B1", "B2", "C1", "C3"],
+  "gold_explanation": "The green water (A1) shows an algae bloom, probably fed by fertiliser runoff (C2). Blooms use up oxygen at night (C3), and oxygen on Sunday night was far too low for fish (B2). A paint spill is ruled out by the water tests (B1), and disease is ruled out by the autopsies (C1).",
+  "notes": "Toy example for testing the tool. A2 + B3 is a trap that points to disease; C1 rules it out. Replace with your own scenarios."
+}
