@@ -29,6 +29,13 @@ strategy to each agent at the start of every round (one turn per agent). It neve
 sees the gold answer. How it decides is a setting: fixed rules over the public record, an LLM that reads
 the public record, a fixed schedule, or random assignment (a control).
 
+v0.6: reconstructions are structured (premises are fact IDs and turns; the assumption is an
+"If ..., then ..." bridge) and written before the move; flawed moves are sent back once to be fixed.
+After the dialogue each agent privately writes its own answer as a proof tree plus a plain-English
+explanation (the closing round). The judge does the same from the public record, the pooled baseline
+from all facts, and the gold tree is put into plain English. One more judge call checks every step and
+every explanation. All trees are compared with the gold tree.
+
 Afterwards: a judge answers from the public record only; the app builds the argument
 graph from the targets the agents declared and labels it with grounded semantics;
 optionally the judge checks each reading against what the original speaker meant.
@@ -47,7 +54,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Inquiry Arena", page_icon="🔎", layout="wide")
 
-APP_VERSION = "inquiry-arena v0.5.2"
+APP_VERSION = "inquiry-arena v0.6"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 AVATARS = ["🟦", "🟧", "🟩", "🟪", "🟥", "🟨", "⬛", "⬜"]
@@ -72,25 +79,38 @@ How it works:
 - Each agent also has PRIVATE facts. Others only learn your facts if you state them.
 - People talk briefly: they state one fact and say what it is for, without spelling out every assumption.
   So each time you make an argument you ALSO write a private reconstruction. Nobody else sees it
-  unless someone asks for it:
-  * reading_of_target: how you understand the argument you are responding to: its premises,
-    the unstated assumption it relies on, and its conclusion (null if you target an answer directly);
-  * aim: which part of the target you attack or support: "premise", "assumption" or "conclusion";
-  * mine: your own argument in full: premises, unstated assumption, conclusion.
+  unless someone asks for it. Write it in this order, BEFORE you decide your own move:
+  * reading_of_target (only when you respond to a turn; null when you aim at an answer): that argument
+    as its speaker most plausibly meant it, from their fact and their words only. Do not credit them with
+    anything they did not say or need, and do not shape your reading to suit your reply;
+  * then your move, and aim: the part of the target you attack or support ("premise", "assumption" or "conclusion");
+  * mine: your own argument in full.
+  A reading and your own argument have the same three parts:
+  * premises: a list of IDs only: facts (yours or already public) and earlier turns, e.g. ["B3", "turn 2"];
+  * assumption: the unstated general rule that, added to the premises, makes the conclusion follow,
+    written as "If ..., then ...". It must not repeat a premise;
+  * conclusion: what the argument claims.
+  Every assumption and conclusion is a full sentence that could be true or false, never a topic.
+  If no public fact establishes your assumption, also put it in "opens".
+  Example (fact K2 "the bakery opens at 7 am", supporting turn 1, which said Maria reached the bakery at 6:30 am):
+    good: {{"premises": ["K2", "turn 1"], "assumption": "If someone reaches a shop before it opens, then they have to wait",
+            "conclusion": "Maria had to wait outside the bakery."}}
+    bad:  {{"premises": ["bakery hours"], "assumption": "The bakery opens at 7 am", "conclusion": "Waiting"}}
+          (a topic as a premise, an assumption that repeats a premise, a conclusion that is not a sentence)
 - Open goals: a public list of statements the group still needs to establish (G1, G2, ...).
   Anyone can post one. An argument can say which open goal it answers, and can open new goals.
 - Be honest: use only your own facts or facts already on the table. Never invent facts or IDs.
 
 On each turn reply with ONLY one flat JSON object (do not nest it inside another object), one of these:
 
-1. Make an argument with exactly ONE fact:
-{{"move": "assert", "fact": "ID", "target": <turn number or answer letter>, "relation": "attack" or "support",
+1. Make an argument with exactly ONE fact (keep the keys in this order):
+{{"move": "assert", "target": <turn number or answer letter>,
+  "reading_of_target": {{"premises": ["ID or turn N", ...], "assumption": "If ..., then ...", "conclusion": "..."}} or null,
+  "fact": "ID", "relation": "attack" or "support", "aim": "premise" or "assumption" or "conclusion",
+  "mine": {{"premises": ["ID or turn N", ...], "assumption": "If ..., then ...", "conclusion": "..."}},
   "say": "what you say out loud, one or two sentences",
   "answers_goal": "G<number>" or null,
-  "opens": ["a statement this argument still needs, not yet established", ...] or [],
-  "reconstruction": {{"reading_of_target": {{"premises": "...", "assumption": "...", "conclusion": "..."}},
-                      "aim": "premise" or "assumption" or "conclusion",
-                      "mine": {{"premises": "...", "assumption": "...", "conclusion": "..."}}}}}}
+  "opens": ["a statement this argument still needs, not yet established", ...] or []}}
 
 2. Post an open goal, without stating a fact:
 {{"move": "ask", "goal": "the statement the group needs to establish", "for": <answer letter, turn number or null>,
@@ -236,9 +256,41 @@ def match_strategy(x):
 FORMAT_REMINDER = """
 
 IMPORTANT: your last reply could not be read. Reply with exactly one flat JSON object and nothing else,
-for example: {"move": "pass"}, or {"move": "assert", "fact": "ID", "target": "A", "relation": "support",
-"say": "...", "answers_goal": null, "opens": [], "reconstruction": {"reading_of_target": null, "aim": "conclusion",
-"mine": {"premises": "...", "assumption": "...", "conclusion": "..."}}}"""
+for example: {"move": "pass"}, or {"move": "assert", "target": "A", "reading_of_target": null, "fact": "ID",
+"relation": "support", "aim": "conclusion", "mine": {"premises": ["ID"], "assumption": "If ..., then ...",
+"conclusion": "..."}, "say": "...", "answers_goal": null, "opens": []}"""
+
+FIX_REMINDER = """
+
+Your last reply had these problems:
+{problems}
+Reply again with one corrected JSON object (or choose a different move)."""
+
+# ---- after the dialogue: trees and plain-English explanations
+TREE_FORMAT = ('[{"id": "S1", "premises": ["ID", "ID"], "conclusion": "one full sentence"}, '
+               '{"id": "S2", "premises": ["S1", "ID"], "conclusion": "..."}]')
+EXPLAIN_RULE = ("two to four sentences of connected, natural English that someone who has not seen the facts could "
+                "follow. Say why, with words like because, so and therefore. No fact IDs, no lists, and nothing "
+                "that is not in your tree")
+CLOSING_SYSTEM = ("You are {name}, one of the agents in an inquiry that has just ended. "
+                  "Reply with ONLY one JSON object, nothing else.")
+CLOSING_TASK = """The discussion is over. Now, privately (no other agent will see this), give your own answer
+and explanation. Build the explanation as a small proof tree, then write it out in plain English.
+- tree: steps S1, S2, ... Each step combines its premises into one conclusion. Premises are IDs of facts you can
+  see (your own facts, public facts, facts stated in the discussion) or earlier steps. You may use your own facts
+  even if you never said them. Use only what supports your answer. The last step concludes the answer.
+- explanation: """ + EXPLAIN_RULE + """.
+Reply with ONLY: {"answer": "<letter>", "tree": """ + TREE_FORMAT + """, "explanation": "..."}"""
+JUDGE_TASK = """Based only on the information above, which answer is best supported? Build the explanation as a
+small proof tree whose premises are only IDs of the facts listed above (or earlier steps), then write it out in
+plain English.
+- explanation: """ + EXPLAIN_RULE + """.
+Reply with ONLY: {"answer": "<letter>", "tree": """ + TREE_FORMAT + """, "explanation": "...", "facts_used": ["ID", ...]}"""
+GOLD_SYSTEM = "You rewrite proofs as short explanations. Reply with ONLY one JSON object, nothing else."
+CHECK_TREES_SYSTEM = ("You check proof steps and explanations. You know only what is written in the message. "
+                      "Reply with ONLY one JSON object, nothing else.")
+HOLDER_FILL = ["#d6ebe8", "#f6e7c8", "#e5dcf3", "#dbe7f6", "#f3dcdc", "#e2efd7"]
+PUBLIC_FILL = "#eeeeee"
 
 MOVE_ALIASES = {"assert": "assert", "show": "show", "show_reconstruction": "show", "reveal": "show",
                 "retract": "retract", "withdraw": "retract", "ask": "ask", "open_goal": "ask",
@@ -442,12 +494,131 @@ def parse_relation(raw):
     return ""
 
 
+def norm_premises(x):
+    """A list of premise tokens: fact IDs as written, or 'turn N'."""
+    if x is None:
+        return []
+    items = list(x) if isinstance(x, (list, tuple)) else re.split(r"[;,]", _s(x))
+    out = []
+    for it in items:
+        v = _s(it).strip().strip('"\'').strip()
+        if not v or v.lower() in ("none", "null"):
+            continue
+        m = re.fullmatch(r"(?:turn\s*|#)(\d+)", v, re.I) or re.fullmatch(r"(\d+)", v)
+        out.append(f"turn {int(m.group(1))}" if m else v)
+    return out
+
+
 def norm_part(x):
     if isinstance(x, dict):
-        return {k: _s(x.get(k)) for k in ("premises", "assumption", "conclusion")}
+        return {"premises": norm_premises(x.get("premises")), "assumption": _s(x.get("assumption")),
+                "conclusion": _s(x.get("conclusion"))}
     if x is None or _s(x).lower() in ("", "null", "none", "n/a"):
         return None
-    return {"premises": "", "assumption": "", "conclusion": _s(x)}
+    return {"premises": [], "assumption": "", "conclusion": _s(x)}
+
+
+def recon_source(obj):
+    """v0.6 puts the reconstruction fields at the top of the reply; older replies nest them."""
+    return obj.get("reconstruction") if isinstance(obj.get("reconstruction"), dict) else obj
+
+
+STOP = set("a an the of to in on is are was were be it its that this and or if then for with as by at from".split())
+
+
+def content_words(t):
+    return {w for w in re.findall(r"[a-z]+", str(t).lower()) if w not in STOP}
+
+
+def overlap(a, b):
+    A, B = content_words(a), content_words(b)
+    return len(A & B) / len(A | B) if A and B else 0.0
+
+
+def gold_steps(sc):
+    """The gold tree as steps: [{"id", "premises", "conclusion"}]."""
+    out = []
+    for line in sc.get("gold_tree") or []:
+        if "->" not in line:
+            continue
+        lhs, rhs = line.split("->", 1)
+        cid, _, text = rhs.partition(":")
+        out.append({"id": cid.strip(), "premises": [x.strip() for x in lhs.split("+") if x.strip()],
+                    "conclusion": text.strip()})
+    return out
+
+
+def step_leafsets(steps):
+    sets = {}
+    for st_ in steps:
+        L = set()
+        for p in st_["premises"]:
+            L |= sets.get(p, {p})
+        sets[st_["id"]] = L
+    return sets
+
+
+def tree_leaves(steps):
+    ids = {st_["id"] for st_ in steps}
+    out = []
+    for st_ in steps:
+        for p in st_["premises"]:
+            if p not in ids and p not in out:
+                out.append(p)
+    return out
+
+
+def compare_tree(steps, sc):
+    """Compare a tree with the gold tree: leaves (by fact ID) and steps (same set of leaves underneath)."""
+    gold = gold_steps(sc)
+    if not gold:
+        return None
+    gl, leaves = set(tree_leaves(gold)), set(tree_leaves(steps))
+    mine = list(step_leafsets(steps).values())
+    matched = [g["id"] for g, L in zip(gold, step_leafsets(gold).values()) if L in mine]
+    return {"gold_leaves": len(gl), "leaves": len(leaves), "leaves_in_gold": len(leaves & gl),
+            "leaf_recall": round(len(leaves & gl) / len(gl), 2) if gl else None,
+            "leaf_precision": round(len(leaves & gl) / len(leaves), 2) if leaves else None,
+            "gold_steps": len(gold), "gold_steps_matched": len(matched), "matched": matched,
+            "not_in_gold": sorted(leaves - gl), "missing_from_gold": sorted(gl - leaves)}
+
+
+def steps_done(steps, view):
+    have, ok, changed = set(view), [], True
+    while changed:
+        changed = False
+        for g in steps:
+            if g["id"] not in ok and all(x in have for x in g["premises"]):
+                have.add(g["id"])
+                ok.append(g["id"])
+                changed = True
+    return ok
+
+
+def norm_tree(raw, allowed):
+    """Clean a tree a model wrote. allowed: the fact IDs this writer may use. Returns (steps, problems)."""
+    if not isinstance(raw, list) or not raw:
+        return [], ["no tree given"]
+    canon = {k.upper(): k for k in allowed}
+    steps, seen, problems = [], set(), []
+    for i, x in enumerate(raw, 1):
+        if not isinstance(x, dict):
+            continue
+        sid = (_s(x.get("id")) or f"S{i}").upper().replace(" ", "")
+        good = []
+        for p in norm_premises(x.get("premises")):
+            P = p.upper().replace(" ", "")
+            if P in seen:
+                good.append(P)
+            elif P in canon:
+                good.append(canon[P])
+            else:
+                problems.append(f"{sid}: '{p}' is not a fact this writer could use, or an earlier step")
+        steps.append({"id": sid, "premises": good, "conclusion": _s(x.get("conclusion"))})
+        seen.add(sid)
+    if not steps:
+        problems.append("no tree given")
+    return steps, problems
 
 
 def norm_recon(r):
@@ -458,12 +629,21 @@ def norm_recon(r):
             "mine": norm_part(r.get("mine"))}
 
 
-def part_text(p):
+def premise_text(prem, facts=None):
+    if isinstance(prem, str):  # older runs: free text
+        return prem
+    out = []
+    for x in prem or []:
+        out.append(f'{x} ("{facts[x]}")' if facts and x in facts else x)
+    return ", ".join(out)
+
+
+def part_text(p, facts=None):
     if not p:
         return "(none)"
     bits = []
     if p.get("premises"):
-        bits.append(f"premises: {p['premises']}")
+        bits.append(f"premises: {premise_text(p['premises'], facts)}")
     if p.get("assumption"):
         bits.append(f"unstated assumption: {p['assumption']}")
     if p.get("conclusion"):
@@ -471,15 +651,15 @@ def part_text(p):
     return "; ".join(bits) or "(empty)"
 
 
-def recon_text(rec):
+def recon_text(rec, facts=None):
     if not rec:
         return "(no reconstruction recorded)"
     s = []
     if rec.get("reading_of_target"):
-        s.append(f"reads the target as [{part_text(rec['reading_of_target'])}]")
+        s.append(f"reads the target as [{part_text(rec['reading_of_target'], facts)}]")
     if rec.get("aim"):
         s.append(f"aims at its {rec['aim']}")
-    s.append(f"own argument [{part_text(rec.get('mine'))}]")
+    s.append(f"own argument [{part_text(rec.get('mine'), facts)}]")
     return "; ".join(s)
 
 
@@ -795,7 +975,7 @@ class Referee:
                         f"{t['turn_requested']}, but {t['problem']}.")
             reason = f' ("{t["reason"]}")' if t["reason"] else ""
             return (f"Turn {t['turn']} - {who} asks to see the private reconstruction behind turn "
-                    f"{t['turn_requested']}{reason}. Revealed record of {t['owner']}: {recon_text(t['revealed'])}.")
+                    f"{t['turn_requested']}{reason}. Revealed record of {t['owner']}: {recon_text(t['revealed'], self.fact_text)}.")
         if t["move"] == "retract":
             if t["problem"]:
                 return f"Turn {t['turn']} - {who} tried to withdraw turn {t['turn_requested']}, but {t['problem']}."
@@ -812,7 +992,7 @@ class Referee:
 
     def agent_prompt(self, agent):
         notes = [f"Turn {t['turn']} (you {describe_target(t).replace('attacks', 'attacked').replace('supports', 'supported')}"
-                 f" with {t['fact'] or 'no fact'}): {recon_text(t['reconstruction'])}"
+                 f" with {t['fact'] or 'no fact'}): {recon_text(t['reconstruction'], self.fact_text)}"
                  + (f" [you withdrew it at turn {t['retracted_at']}]" if t.get("retracted_at") else "")
                  for t in self.table if t["move"] == "assert" and t["agent"] == agent["name"]]
         return (f"Question: {self.sc['question']}\nPossible answers:\n{options_text(self.sc)}\n\n"
@@ -823,6 +1003,83 @@ class Referee:
                 f"Public conversation so far:\n{self.public_record()}\n\n"
                 f"Open goals (public):\n{self.goals_text()}\n\n"
                 "Your move. Reply with one JSON object only.")
+
+    # -- checks on an argument
+    def visible_ids(self, agent):
+        return set(agent["facts"]) | self.on_table | self.public
+
+    def resolve_premises(self, prem, agent, turn_now):
+        canon = {k.upper(): k for k in self.fact_text}
+        vis = self.visible_ids(agent)
+        good, bad = [], []
+        for x in prem:
+            if x.startswith("turn "):
+                k = int(x.split()[1])
+                e = self.entry_at(k)
+                (good if 1 <= k < turn_now and e and e["move"] == "assert" else bad).append(x)
+            elif x.upper() in canon and canon[x.upper()] in vis:
+                good.append(canon[x.upper()])
+            else:
+                bad.append(x)
+        return good, bad
+
+    def recon_problems(self, rec, kind, agent, fact, turn_now):
+        """Problems with a reconstruction. Also puts premises into canonical form, and adds the stated fact
+        to the speaker's own premises if they left it out."""
+        probs = []
+        parts = [("your own argument (mine)", rec.get("mine"))]
+        if kind == "turn":
+            if rec.get("reading_of_target"):
+                parts.insert(0, ("your reading of the target", rec["reading_of_target"]))
+            else:
+                probs.append("you respond to a turn but gave no reading_of_target")
+        for label, prt in parts:
+            if not prt:
+                probs.append(f"{label} is missing")
+                continue
+            good, bad = self.resolve_premises(prt["premises"], agent, turn_now)
+            prt["premises"] = good + bad
+            if bad:
+                probs.append(f"{label}: premises must be fact IDs you can see or earlier turns, not {bad}")
+            elif not good and label.startswith("your reading"):
+                probs.append(f"{label} lists no premises")
+            a = prt.get("assumption", "")
+            if len(a.split()) < 4 or not re.search(r"\b(if|whenever|when|unless)\b", a, re.I):
+                probs.append(f"{label}: the assumption must be an 'If ..., then ...' rule")
+            else:
+                same = [x for x in good if not x.startswith("turn ") and overlap(a, self.fact_text.get(x, "")) >= 0.7]
+                if same:
+                    probs.append(f"{label}: the assumption repeats premise {same[0]}; give the unstated rule instead")
+            if len(prt.get("conclusion", "").split()) < 4:
+                probs.append(f"{label}: the conclusion must be a full sentence")
+        mine = rec.get("mine")
+        if mine is not None and fact in self.fact_text and fact not in mine["premises"]:
+            mine["premises"].insert(0, fact)
+        return probs
+
+    def assert_problems(self, obj, agent, turn_now):
+        """Everything wrong with an assert, without applying it."""
+        fact = obj.get("fact", obj.get("facts"))
+        if isinstance(fact, list):
+            fact = fact[0] if fact else ""
+        fact = _s(fact)
+        probs = []
+        if not fact:
+            probs.append("no fact given")
+        elif fact not in agent["facts"] and fact not in self.on_table:
+            probs.append(f"{fact} is not one of your facts or a fact already on the table")
+        kind, val = parse_target(obj.get("target"), self.letters)
+        if kind == "turn":
+            tgt = self.entry_at(val)
+            if tgt is None or tgt["move"] != "assert" or tgt.get("retracted_at"):
+                probs.append(f"turn {val} is not a live argument you can respond to")
+                kind = None
+        elif kind is None:
+            probs.append("no target: give an earlier turn number or an answer letter")
+        if not parse_relation(obj.get("relation")):
+            probs.append("no relation: say attack or support")
+        probs += self.recon_problems(norm_recon(recon_source(obj)), kind, agent, fact, turn_now)
+        return probs
 
     # -- the moves
     def do_assert(self, entry, obj, agent):
@@ -885,8 +1142,9 @@ class Referee:
                      say=_s(obj.get("say") or obj.get("claim")),
                      answers_goal=answers, opened=opened,
                      opened_texts=[self.goal(g)["text"] for g in opened],
-                     reconstruction=norm_recon(obj.get("reconstruction")),
+                     reconstruction=norm_recon(recon_source(obj)),
                      revealed_at=None, retracted_at=None, problem="; ".join(problems) or None)
+        entry["recon_problems"] = self.recon_problems(entry["reconstruction"], kind, agent, fact, entry["turn"])
 
     def do_ask(self, entry, obj):
         text = obj.get("goal") or obj.get("statement") or obj.get("question") or ""
@@ -1125,9 +1383,21 @@ class Referee:
                                      lambda: self.mock_agent(agent, retry=True))
                 raw = raw + "\n\n--- retry ---\n" + raw2
                 obj, move = read_reply(raw2) if not err else (None, "")
+            sent_back = None
+            if move == "assert" and self.settings.get("fix_moves", True):
+                probs = self.assert_problems(obj, agent, turn)
+                if probs:  # one chance to fix it, with the problems spelled out
+                    note = FIX_REMINDER.format(problems="\n".join(f"- {x}" for x in probs))
+                    raw3, err3 = self.ask(self.models[name], system, prompt + note,
+                                          lambda: self.mock_agent(agent, retry=True))
+                    obj3, move3 = read_reply(raw3) if not err3 else (None, "")
+                    sent_back = {"problems": probs, "replaced": bool(not err3 and move3 in MOVE_ALIASES.values())}
+                    raw = raw + "\n\n--- sent back to fix ---\n" + (raw3 or err3 or "")
+                    if sent_back["replaced"]:
+                        obj, move = obj3, move3
             entry = {"turn": turn, "agent": name, "model": self.models[name], "raw": raw,
                      "error": err, "retried": retried, "strategy": self.current[name],
-                     "round": len(self.rounds) if self.orchestrated else None}
+                     "round": len(self.rounds) if self.orchestrated else None, "sent_back": sent_back}
             next_idx = None
             if move == "assert":
                 self.do_assert(entry, obj, agent)
@@ -1176,21 +1446,199 @@ class Referee:
             for a in self.agents:
                 all_f.update(a["facts"])
             body = f"All known facts:\n{facts_text(all_f)}"
+            allowed = set(all_f)
         else:
             shared = {fid: self.fact_text[fid] for fid in sorted(self.on_table - self.public)}
             body = (f"Public facts:\n{facts_text(self.sc.get('public_facts', {}))}\n\n"
                     f"Facts stated during the discussion:\n{facts_text(shared)}\n\n"
                     f"The discussion:\n{self.public_record()}\n\n"
                     f"Open goals at the end of the discussion:\n{self.goals_text()}")
-        user = (f"Question: {self.sc['question']}\nPossible answers:\n{options_text(self.sc)}\n\n{body}\n\n"
-                "Based only on the information above, which answer is best supported? Reply with ONLY: "
-                '{"answer": "<letter>", "explanation": "<two or three sentences>", "facts_used": ["ID", ...]}')
-        raw, err = self.ask(self.judge_model, JUDGE_SYSTEM, user, self.mock_judge)
+            allowed = set(self.public) | set(self.on_table)
+        user = f"Question: {self.sc['question']}\nPossible answers:\n{options_text(self.sc)}\n\n{body}\n\n{JUDGE_TASK}"
+        raw, err = self.ask(self.judge_model, JUDGE_SYSTEM, user, lambda: self.mock_tree_reply(allowed),
+                            max_tokens=2000)
         obj = parse_json(raw) or {}
         ans = str(obj.get("answer", "")).strip().upper()[:1]
+        tree, tprobs = norm_tree(obj.get("tree"), allowed)
+        used = obj.get("facts_used") if isinstance(obj.get("facts_used"), list) else tree_leaves(tree)
+        used = [_s(x) for x in used]
         return {"model": self.judge_model, "answer": ans, "correct": ans == self.sc["answer"],
-                "explanation": str(obj.get("explanation", "")), "facts_used": obj.get("facts_used", []),
+                "explanation": _s(obj.get("explanation")), "facts_used": used,
+                "facts_used_not_allowed": [x for x in used if x not in allowed],
+                "tree": tree, "tree_problems": tprobs, "raw": raw, "error": err}
+
+    # -- after the dialogue: each agent's own answer, as a tree and in plain English (private)
+    def closing(self):
+        out = {}
+        for a in self.agents:
+            name = a["name"]
+            allowed = self.visible_ids(a)
+            user = (f"Question: {self.sc['question']}\nPossible answers:\n{options_text(self.sc)}\n\n"
+                    f"Public facts:\n{facts_text(self.sc.get('public_facts', {}))}\n\n"
+                    f"Your private facts (only you see these):\n{facts_text(a['facts'])}\n\n"
+                    f"The discussion:\n{self.public_record()}\n\nOpen goals:\n{self.goals_text()}\n\n{CLOSING_TASK}")
+            raw, err = self.ask(self.models[name], CLOSING_SYSTEM.format(name=name), user,
+                                lambda allowed=allowed: self.mock_tree_reply(allowed), max_tokens=2000)
+            obj = parse_json(raw) or {}
+            ans = _s(obj.get("answer")).upper()[:1]
+            tree, tprobs = norm_tree(obj.get("tree"), allowed)
+            out[name] = {"answer": ans, "correct": ans == self.sc["answer"], "tree": tree, "tree_problems": tprobs,
+                         "explanation": _s(obj.get("explanation")),
+                         "unsaid_own_facts_used": [x for x in tree_leaves(tree)
+                                                   if x in a["facts"] and x not in self.on_table],
+                         "raw": raw, "error": err}
+        return out
+
+    # -- the gold tree, in plain English (one call; the gold tree itself is never shown to any agent)
+    def verbalise_gold(self):
+        gold = gold_steps(self.sc)
+        if not gold:
+            return None
+        facts = all_facts(self.sc)
+        concl = {g["id"]: g["conclusion"] for g in gold}
+        lines = [f"- From: {' AND '.join(facts.get(x) or concl.get(x) or x for x in g['premises'])}\n"
+                 f"  it follows: {g['conclusion']}" for g in gold]
+        user = (f"Question: {self.sc['question']}\nCorrect answer: {self.sc['answer']}. "
+                f"{self.sc['options'][self.sc['answer']]}\n\nProof, step by step:\n" + "\n".join(lines) +
+                "\n\nRewrite this proof as an explanation of the answer in two to four sentences of connected, natural "
+                "English for a student. Keep the reasoning; use only what the proof says and add nothing; no lists, "
+                'no IDs.\nReply with ONLY: {"explanation": "..."}')
+        raw, err = self.ask(self.judge_model, GOLD_SYSTEM, user,
+                            lambda: json.dumps({"explanation": "(mock) " + " So ".join(g["conclusion"] for g in gold)}),
+                            max_tokens=600)
+        return {"explanation": _s((parse_json(raw) or {}).get("explanation")), "model": self.judge_model,
                 "raw": raw, "error": err}
+
+    def collect_trees(self, judge, pooled, closing, gold_text):
+        trees = {}
+        gold = gold_steps(self.sc)
+        if gold:
+            trees["Gold"] = {"kind": "gold", "answer": self.sc["answer"], "correct": True, "tree": gold,
+                             "tree_problems": [], "explanation": (gold_text or {}).get("explanation", ""),
+                             "compare": compare_tree(gold, self.sc)}
+        for name, c in (closing or {}).items():
+            trees[name] = {"kind": "agent", "answer": c["answer"], "correct": c["correct"], "tree": c["tree"],
+                           "tree_problems": c["tree_problems"], "explanation": c["explanation"],
+                           "unsaid_own_facts_used": c["unsaid_own_facts_used"],
+                           "compare": compare_tree(c["tree"], self.sc)}
+        for key, j in (("Judge", judge), ("Pooled", pooled)):
+            if j:
+                trees[key] = {"kind": key.lower(), "answer": j["answer"], "correct": j["correct"], "tree": j["tree"],
+                              "tree_problems": j["tree_problems"], "explanation": j["explanation"],
+                              "facts_used_not_allowed": j.get("facts_used_not_allowed", []),
+                              "compare": compare_tree(j["tree"], self.sc)}
+        return trees
+
+    # -- one call that checks every step of every tree, and every explanation against its tree
+    def check_trees(self, trees):
+        facts = all_facts(self.sc)
+        blocks = []
+        for name, t in trees.items():
+            concl = {x["id"]: x["conclusion"] for x in t["tree"]}
+            lines = [f'Tree "{name}"' + (" (reference proof: rate its explanation only)" if t["kind"] == "gold" else "")]
+            for x in t["tree"]:
+                prem = "; ".join(f'[{p}: "{facts.get(p) or concl.get(p, p)}"]' for p in x["premises"]) or "(none)"
+                lines.append(f'  {x["id"]}: from {prem} it concludes: "{x["conclusion"]}"')
+            lines.append(f'  Explanation: "{t["explanation"] or "(none)"}"')
+            blocks.append("\n".join(lines))
+        user = ("Below are proof trees for the question, each followed by a plain-English explanation.\n"
+                f"Question: {self.sc['question']}\nPossible answers:\n{options_text(self.sc)}\n\n" + "\n\n".join(blocks) +
+                "\n\nFor every step (except in reference proofs): valid = the conclusion follows from the premises, "
+                "allowing only obvious common-sense links; anything more is not valid.\n"
+                "For every explanation: faithful = it says nothing its tree does not support; readable = connected, "
+                "natural English that someone who has not seen the facts could follow.\n"
+                'Reply with ONLY: {"steps": [{"tree": "<name>", "step": "S1", "valid": true, "note": "a few words"}], '
+                '"explanations": [{"tree": "<name>", "faithful": true, "readable": true, "note": "a few words"}]}')
+        raw, err = self.ask(self.judge_model, CHECK_TREES_SYSTEM, user, lambda: self.mock_check_trees(trees),
+                            max_tokens=3000)
+        obj = parse_json(raw) or {}
+        lower = {k.lower(): k for k in trees}
+        for x in obj.get("steps") or []:
+            if not isinstance(x, dict):
+                continue
+            t = trees.get(lower.get(_s(x.get("tree")).lower(), ""))
+            if t and t["kind"] != "gold":
+                for st_ in t["tree"]:
+                    if st_["id"] == _s(x.get("step")).upper().replace(" ", ""):
+                        st_["valid"] = bool(x.get("valid")) if isinstance(x.get("valid"), bool) else None
+                        st_["check_note"] = _s(x.get("note"))
+        for x in obj.get("explanations") or []:
+            if not isinstance(x, dict):
+                continue
+            t = trees.get(lower.get(_s(x.get("tree")).lower(), ""))
+            if t:
+                t["explanation_check"] = {"faithful": x.get("faithful") if isinstance(x.get("faithful"), bool) else None,
+                                          "readable": x.get("readable") if isinstance(x.get("readable"), bool) else None,
+                                          "note": _s(x.get("note"))}
+        return {"raw": raw, "error": err}
+
+    # -- what could be proved, turn by turn: the public record and each agent's own view (no model call)
+    def proof_progress(self):
+        gold = gold_steps(self.sc)
+        if not gold:
+            return None
+
+        def done(view):
+            have, ok, changed = set(view), [], True
+            while changed:
+                changed = False
+                for g in gold:
+                    if g["id"] not in ok and all(x in have for x in g["premises"]):
+                        have.add(g["id"])
+                        ok.append(g["id"])
+                        changed = True
+            return ok
+
+        public, rows = set(self.public), []
+        pub_full, view_full = None, {nm: None for nm in self.names}
+        for t in [None] + self.table:
+            if t and t["move"] == "assert" and t.get("fact_status") in ("new", "on table"):
+                public.add(t["fact"])
+            turn = t["turn"] if t else 0
+            row = {"turn": turn, "public": len(done(public))}
+            for a in self.agents:
+                row[a["name"]] = len(done(public | set(a["facts"])))
+                if row[a["name"]] == len(gold) and view_full[a["name"]] is None:
+                    view_full[a["name"]] = turn
+            if row["public"] == len(gold) and pub_full is None:
+                pub_full = turn
+            rows.append(row)
+        T = len(self.table)
+        held = {nm: (max(0, (pub_full if pub_full is not None else T) - v) if v is not None else 0)
+                for nm, v in view_full.items()}
+        return {"gold_steps": len(gold), "rows": rows, "public_complete_at": pub_full,
+                "full_proof_in_own_view_from": view_full, "turns_held_privately": held,
+                "public_steps_at_end": rows[-1]["public"]}
+
+    def finish(self, run_pooled=True, on_status=lambda s: None):
+        """Everything after the dialogue. The app and the batch runner both call this."""
+        on_status("The judge is reading the public record...")
+        judge = self.judge(pooled=False)
+        pooled = None
+        if run_pooled:
+            on_status("Running the pooled baseline...")
+            pooled = self.judge(pooled=True)
+        reading = None
+        if self.settings["check_readings"]:
+            on_status("The judge is checking how each argument was read...")
+            reading = self.check_readings()
+        closing = {}
+        if self.settings.get("closing_round", True):
+            on_status("Closing round: each agent writes its own tree and explanation...")
+            closing = self.closing()
+        gold_text = None
+        if self.settings.get("explain_gold", True):
+            on_status("Putting the gold tree into plain English...")
+            gold_text = self.verbalise_gold()
+        self.trees = self.collect_trees(judge, pooled, closing, gold_text)
+        tree_check = None
+        if self.settings.get("check_trees", True) and self.trees:
+            on_status("Checking every step and every explanation...")
+            tree_check = self.check_trees(self.trees)
+        self.progress = self.proof_progress()
+        return {"judge": judge, "pooled": pooled, "reading_check": reading, "closing": closing,
+                "gold_plain": gold_text, "trees": self.trees, "tree_check": tree_check,
+                "proof_progress": self.progress, "graph": self.declared_graph(self.settings["support_rule"])}
 
     # -- did responders read arguments the way their speakers meant them?
     def reading_pairs(self):
@@ -1213,9 +1661,9 @@ class Referee:
                 f"Pair {t['turn']}->{o['turn']}\n"
                 f"  What {o['agent']} said at turn {o['turn']}: fact {o['fact']} "
                 f"(\"{self.fact_text.get(o['fact'], '?')}\"), \"{o['say']}\"\n"
-                f"  What {o['agent']} privately meant: {part_text(o['reconstruction']['mine'])}\n"
+                f"  What {o['agent']} privately meant: {part_text(o['reconstruction']['mine'], self.fact_text)}\n"
                 f"  How {t['agent']} read it at turn {t['turn']}: "
-                f"{part_text(t['reconstruction']['reading_of_target'])}")
+                f"{part_text(t['reconstruction']['reading_of_target'], self.fact_text)}")
         user = ("For each pair, compare how a responder read an argument with what the argument's speaker "
                 "privately meant. Focus on the unstated assumption and the conclusion. Rate each pair:\n"
                 '"match": the same argument;\n'
@@ -1298,26 +1746,49 @@ class Referee:
                                "reason": "(mock) That rested on a misreading."})
         unshared = [f for f in agent["facts"] if f not in self.on_table]
         if unshared and r < 0.8:
+            fact = random.choice(unshared)
             live = [t for t in others if not t.get("retracted_at")]
+            rule = "If (mock) this holds for the case, then the claim follows"
             if live and random.random() < 0.6:
-                target = random.choice(live)["turn"]
-                reading = {"premises": "(mock)", "assumption": "(mock) what I think they assume",
-                           "conclusion": "(mock)"}
+                tgt = random.choice(live)
+                target = tgt["turn"]
+                reading = {"premises": [tgt["fact"]], "assumption": rule,
+                           "conclusion": "(mock) the speaker's conclusion as I read it"}
             else:
                 target, reading = random.choice(self.letters), None
-            reply = {
-                "move": "assert", "fact": random.choice(unshared), "target": target,
-                "relation": random.choice(["attack", "support"]), "say": "(mock) This matters.",
-                "answers_goal": random.choice(open_goals)["id"] if open_goals and random.random() < 0.5 else None,
-                "opens": ["(mock) a premise this still needs"] if random.random() < 0.3 else [],
-                "reconstruction": {"reading_of_target": reading,
-                                   "aim": random.choice(["premise", "assumption", "conclusion"]),
-                                   "mine": {"premises": "(mock)", "assumption": "(mock) what I assume",
-                                            "conclusion": "(mock)"}}}
+            mine_part = {"premises": [fact] + ([f"turn {target}"] if reading else []), "assumption": rule,
+                         "conclusion": "(mock) my conclusion in a full sentence"}
+            if not retry and random.random() < 0.25:  # a typical flaw: a topic as premise, an assumption that is a fact
+                mine_part = {"premises": ["(mock topic)"], "assumption": self.fact_text[fact], "conclusion": "Topic"}
+            reply = {"move": "assert", "target": target, "reading_of_target": reading, "fact": fact,
+                     "relation": random.choice(["attack", "support"]),
+                     "aim": random.choice(["premise", "assumption", "conclusion"]), "mine": mine_part,
+                     "say": "(mock) This matters.",
+                     "answers_goal": random.choice(open_goals)["id"] if open_goals and random.random() < 0.5 else None,
+                     "opens": ["(mock) a premise this still needs"] if random.random() < 0.3 else []}
             if random.random() < 0.2:  # the nested format some models use
                 reply = {"move": reply}
             return json.dumps(reply)
         return json.dumps({"move": "pass"})
+
+    def mock_tree_reply(self, allowed):
+        ids = sorted(allowed)
+        random.shuffle(ids)
+        steps = []
+        if ids:
+            steps.append({"id": "S1", "premises": ids[:2], "conclusion": "(mock) a first conclusion in full."})
+            if len(ids) > 2:
+                steps.append({"id": "S2", "premises": ["S1", ids[2]], "conclusion": "(mock) so the answer follows."})
+        return json.dumps({"answer": random.choice(self.letters), "tree": steps,
+                           "explanation": "(mock) Because of the first point, the second follows, so the answer holds.",
+                           "facts_used": [x for st_ in steps for x in st_["premises"] if not x.startswith("S")]})
+
+    def mock_check_trees(self, trees):
+        return json.dumps({
+            "steps": [{"tree": nm, "step": x["id"], "valid": random.random() < 0.7, "note": "(mock)"}
+                      for nm, t in trees.items() if t["kind"] != "gold" for x in t["tree"]],
+            "explanations": [{"tree": nm, "faithful": random.random() < 0.7, "readable": random.random() < 0.8,
+                              "note": "(mock)"} for nm in trees]})
 
     def mock_judge(self):
         return json.dumps({"answer": random.choice(self.letters),
@@ -1386,6 +1857,38 @@ class Referee:
             "unreadable_replies": sum(1 for t in self.table if t["move"] == "unreadable" and not t.get("error")),
             "replies_needing_retry": sum(1 for t in self.table if t.get("retried")),
             "api_errors": sum(1 for t in self.table if t.get("error")),
+            **self.tree_metrics(asserts),
+        }
+
+    def tree_metrics(self, asserts):
+        tr = getattr(self, "trees", None) or {}
+        pg = getattr(self, "progress", None) or {}
+        ag = [v for v in tr.values() if v["kind"] == "agent"]
+        steps = lambda vs: [x for v in vs for x in v["tree"]]
+        cmp_ = lambda key, f: (tr.get(key) or {}).get("compare", {}) and tr[key]["compare"].get(f)
+        checked = [v["explanation_check"] for v in tr.values() if v.get("explanation_check")]
+        j = [tr["Judge"]] if "Judge" in tr else []
+        return {
+            "recon_flawed": sum(1 for t in asserts if t.get("recon_problems")),
+            "moves_sent_back": sum(1 for t in self.table if t.get("sent_back")),
+            "agents_correct": sum(1 for v in ag if v["correct"]) if ag else None,
+            "agents_with_all_gold_leaves": sum(1 for v in ag if v["compare"] and not v["compare"]["missing_from_gold"])
+            if ag else None,
+            "agents_unsaid_facts_used": sum(len(v["unsaid_own_facts_used"]) for v in ag) if ag else None,
+            "agents_steps_valid": sum(1 for x in steps(ag) if x.get("valid") is True) if ag else None,
+            "agents_steps_total": len(steps(ag)) if ag else None,
+            "judge_tree_leaf_recall": cmp_("Judge", "leaf_recall"),
+            "judge_tree_gold_steps_matched": cmp_("Judge", "gold_steps_matched"),
+            "judge_tree_problems": len(j[0]["tree_problems"]) if j else None,
+            "judge_steps_valid": sum(1 for x in steps(j) if x.get("valid") is True) if j else None,
+            "judge_steps_total": len(steps(j)) if j else None,
+            "explanations_checked": len(checked),
+            "explanations_faithful": sum(1 for c in checked if c.get("faithful") is True),
+            "explanations_readable": sum(1 for c in checked if c.get("readable") is True),
+            "gold_steps_total": pg.get("gold_steps"),
+            "gold_steps_public_at_end": pg.get("public_steps_at_end"),
+            "public_proof_complete_at": pg.get("public_complete_at"),
+            "max_turns_proof_held_privately": max((pg.get("turns_held_privately") or {}).values(), default=None),
         }
 
 
@@ -1394,15 +1897,15 @@ class Referee:
 BADGE = {"match": ":green[match]", "partial": ":orange[partial]", "mismatch": ":red[mismatch]"}
 
 
-def show_recon(rec):
+def show_recon(rec, facts=None):
     if not rec:
         st.caption("No reconstruction recorded.")
         return
     if rec.get("reading_of_target"):
-        st.markdown(f"**Reads the target as:** {part_text(rec['reading_of_target'])}")
+        st.markdown(f"**Reads the target as:** {part_text(rec['reading_of_target'], facts)}")
     if rec.get("aim"):
         st.markdown(f"**Aims at:** {rec['aim']}")
-    st.markdown(f"**Own argument:** {part_text(rec.get('mine'))}")
+    st.markdown(f"**Own argument:** {part_text(rec.get('mine'), facts)}")
 
 
 def show_turn(entry, avatar, facts):
@@ -1442,8 +1945,10 @@ def show_turn(entry, avatar, facts):
                 st.caption(f"Withdrawn at turn {entry['retracted_at']}.")
             seen = (f"revealed at turn {entry['revealed_at']}" if entry.get("revealed_at")
                     else "not seen by other agents")
+            if entry.get("recon_problems"):
+                st.caption(":orange[Reconstruction: " + "; ".join(entry["recon_problems"]) + "]")
             with st.expander(f"🔒 Private reconstruction ({seen})"):
-                show_recon(entry["reconstruction"])
+                show_recon(entry["reconstruction"], facts)
                 rc = entry.get("reading_check")
                 if rc:
                     st.markdown(f"**Reading check:** {BADGE.get(rc['rating'], rc['rating'])} {rc['note']}")
@@ -1454,7 +1959,7 @@ def show_turn(entry, avatar, facts):
                 if entry["reason"]:
                     st.markdown(f"> {entry['reason']}")
                 st.markdown(f"Revealed **{entry['owner']}**'s reconstruction behind turn {entry['turn_requested']}:")
-                show_recon(entry["revealed"])
+                show_recon(entry["revealed"], facts)
         elif mv == "retract":
             if entry["reason"]:
                 st.markdown(f"> {entry['reason']}")
@@ -1471,8 +1976,119 @@ def show_turn(entry, avatar, facts):
             st.caption(":orange[The reply could not be read, even after one retry. Not counted as a pass.]")
         if entry.get("retried") and mv != "unreadable":
             st.caption("The first reply could not be read; this is the retry.")
+        sb = entry.get("sent_back")
+        if sb:
+            st.caption(("Sent back once to fix: " if sb["replaced"] else "Sent back once, but the fix was unreadable: ")
+                       + "; ".join(sb["problems"]))
         with st.expander("raw model output"):
             st.code(entry.get("raw") or "(empty)", language=None)
+
+
+def tree_dot(t, run):
+    sc = run["scenario"]
+    names = [a["name"] for a in sc["agents"]]
+    holder = {f: i for i, a in enumerate(sc["agents"]) for f in a["facts"]}
+    facts = all_facts(sc)
+    said = run.get("first_shared") or {}
+    public_ids = set(sc.get("public_facts", {}))
+    steps = t["tree"]
+    leaves = tree_leaves(steps)
+    lines = ['digraph G {', '  graph [rankdir=BT, bgcolor="white", nodesep=0.3, ranksep=0.45];',
+             '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, penwidth=1.5];',
+             '  edge [color="#52606d"];']
+    for f in leaves:
+        if f in public_ids:
+            who, fill, tag = "public", PUBLIC_FILL, "public"
+        elif f in holder:
+            i = holder[f]
+            who, fill = names[i], HOLDER_FILL[i % len(HOLDER_FILL)]
+            tag = f"said, turn {said[f]}" if f in said else "never said"
+        else:
+            who, fill, tag = "?", PUBLIC_FILL, "unknown"
+        out_loud = f in public_ids or f in said
+        lines.append(f'  "{f}" [label="{_dot_text(f"{f} ({who}, {tag})", 60)}\\n{_dot_text(facts.get(f, ""), 30)}", '
+                     f'fillcolor="{fill}", color="{"#1f2933" if out_loud else "#8a96a3"}", '
+                     f'style="rounded,filled{"" if out_loud else ",dashed"}"];')
+    avail = set(steps_done(steps, public_ids | set(said))) if t["kind"] == "gold" else set()
+    root = steps[-1]["id"] if steps else None
+    for x in steps:
+        if t["kind"] == "gold":
+            ok = x["id"] in avail
+            fill, border, dash = ("#d3f2da", "#1e7b34", "") if ok else ("white", "#8a96a3", ",dashed")
+        else:
+            v = x.get("valid")
+            fill, border, dash = (("#d3f2da", "#1e7b34", "") if v is True else
+                                  ("#f9d6d5", "#b42318", "") if v is False else ("white", "#6b6b6b", ""))
+        pw = 2.6 if x["id"] == root else 1.5
+        lines.append(f'  "{x["id"]}" [label="{_dot_text(x["id"] + ": " + (x["conclusion"] or "(no conclusion)"), 36)}", '
+                     f'fillcolor="{fill}", color="{border}", penwidth={pw}, style="rounded,filled{dash}"];')
+        for prem in x["premises"]:
+            lines.append(f'  "{prem}" -> "{x["id"]}";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def yes_no(v):
+    return {True: ":green[yes]", False: ":red[no]"}.get(v, "not checked")
+
+
+def show_trees(run):
+    trees = run.get("trees") or {}
+    if not trees:
+        return
+    st.subheader("Trees and explanations")
+    st.caption("After the dialogue each agent privately writes its own answer as a proof tree plus a plain-English "
+               "explanation, from what it could see (its own facts and everything public). The judge does the same "
+               "from the public record only, the pooled baseline from all facts, and the gold tree is put into plain "
+               "English. Leaves are coloured by who held the fact; a dashed border means it was never said. Steps: "
+               "green = checked valid, red = not valid, white = not checked. In the gold tree, green = every premise "
+               "was public by the end.")
+    rows = []
+    for nm, t in trees.items():
+        c = t.get("compare") or {}
+        ec = t.get("explanation_check") or {}
+        rows.append({
+            "tree": nm, "answer": (t["answer"] + (" (right)" if t["correct"] else " (wrong)")) if t["answer"] else "-",
+            "gold facts used": f"{c['leaves_in_gold']} / {c['gold_leaves']}" if c else "",
+            "other facts used": ", ".join(c.get("not_in_gold", [])) if c else "",
+            "gold steps matched": f"{c['gold_steps_matched']} / {c['gold_steps']}" if c else "",
+            "steps valid": "" if t["kind"] == "gold" else
+            f"{sum(1 for x in t['tree'] if x.get('valid') is True)} / {len(t['tree'])}",
+            "own facts used but never said": ", ".join(t.get("unsaid_own_facts_used") or []),
+            "explanation faithful": {True: "yes", False: "no"}.get(ec.get("faithful"), ""),
+            "explanation readable": {True: "yes", False: "no"}.get(ec.get("readable"), ""),
+            "tree problems": len(t["tree_problems"])})
+    st.dataframe(rows, hide_index=True, width="stretch")
+    for tab, (nm, t) in zip(st.tabs(list(trees)), trees.items()):
+        with tab:
+            st.markdown(f"> {t['explanation']}" if t["explanation"] else "*No explanation.*")
+            ec = t.get("explanation_check")
+            if ec:
+                st.caption(f"Faithful to its tree: {yes_no(ec['faithful'])} · readable: {yes_no(ec['readable'])}"
+                           + (f" · {ec['note']}" if ec.get("note") else ""))
+            if t["tree"]:
+                st.graphviz_chart(tree_dot(t, run), width="stretch")
+            for x in t["tree"]:
+                if x.get("valid") is False and x.get("check_note"):
+                    st.caption(f":red[{x['id']} not valid:] {x['check_note']}")
+            for pr in t["tree_problems"]:
+                st.caption(f":orange[{pr}]")
+            if t.get("facts_used_not_allowed"):
+                st.caption(":red[Cited facts it could not have seen: " + ", ".join(t["facts_used_not_allowed"]) + "]")
+    pg = run.get("proof_progress")
+    if pg:
+        st.markdown("**What could be proved, turn by turn.** Gold steps complete in the public record, and in each "
+                    "agent's own view (its own facts plus everything public). No model involved.")
+        for nm, v in pg["full_proof_in_own_view_from"].items():
+            if v is not None:
+                held = pg["turns_held_privately"][nm]
+                st.caption(f"{nm} could complete the whole gold proof in its own view from turn {v}"
+                           + (f"; it stayed incomplete in public for {held} more turn(s)." if held else "."))
+        pub = pg["public_complete_at"]
+        st.caption(f"Public record: {pg['public_steps_at_end']} of {pg['gold_steps']} gold steps complete at the end"
+                   + (f" (complete from turn {pub})." if pub is not None else "."))
+        with st.expander("Turn by turn"):
+            st.dataframe(pg["rows"], hide_index=True, width="stretch")
 
 
 def show_round(rec):
@@ -1635,9 +2251,14 @@ def show_results(run):
     st.markdown(f"**Judge's explanation:** {j['explanation'] or '(none)'}")
     if j.get("error"):
         st.error(j["error"])
+    gp = (run.get("gold_plain") or {}).get("explanation")
+    if gp:
+        st.markdown(f"**Gold explanation (the gold tree in plain English):** {gp}")
     if sc.get("gold_explanation"):
-        st.markdown(f"**Gold explanation:** {sc['gold_explanation']}")
+        with st.expander("Gold explanation as written out by the converter (long form)"):
+            st.markdown(sc["gold_explanation"])
 
+    show_trees(run)
     show_orchestrator(run)
     show_graph(run["graph"], sc, stamp)
     show_reconstructions(run)
@@ -1729,6 +2350,15 @@ with st.sidebar:
                                  help="The judge compares each responder's reading with what the "
                                       "speaker privately meant.")
     run_pooled = st.checkbox("Also run pooled baseline (judge sees all facts)", value=True)
+    fix_moves = st.checkbox("Send a flawed argument back once to be fixed", value=True,
+                            help="Missing target, a fact the agent doesn't hold, or a reconstruction that breaks the "
+                                 "format (premises that aren't IDs, an assumption that isn't an If-then rule or just "
+                                 "repeats a premise, a conclusion that isn't a sentence).")
+    with st.expander("After the dialogue"):
+        closing_round = st.checkbox("Closing round: each agent writes its own tree and explanation (private)",
+                                    value=True, help="One call per agent.")
+        explain_gold = st.checkbox("Put the gold tree into plain English (one judge call)", value=True)
+        check_trees = st.checkbox("Check every step and explanation (one judge call)", value=True)
     support_rule = st.checkbox("Support for one answer counts as attack on the others", value=True,
                                help="Answers are mutually exclusive, so arguing for B argues against A and C. "
                                     "Turn off to label the graph with attacks only.")
@@ -1812,7 +2442,9 @@ if st.button(f"▶ Run dialogue ({condition_label(strategy, policy)})", type="pr
     settings = {"max_turns": max_turns, "temperature": temperature, "mock": mock,
                 "show_targets": show_targets, "check_readings": check_readings, "support_rule": support_rule,
                 "strategy": strategy, "policy": policy, "orchestrator_model": orchestrator_model,
-                "orchestrator_sees_private": oracle, "last_call": last_call, "seed": None}
+                "orchestrator_sees_private": oracle, "last_call": last_call, "seed": None,
+                "fix_moves": fix_moves, "closing_round": closing_round, "explain_gold": explain_gold,
+                "check_trees": check_trees}
     ref = Referee(sc, models, judge_model, settings, api_key, models_available)
     avatar = {a["name"]: AVATARS[i % len(AVATARS)] for i, a in enumerate(sc["agents"])}
     facts = all_facts(sc)
@@ -1831,17 +2463,7 @@ if st.button(f"▶ Run dialogue ({condition_label(strategy, policy)})", type="pr
             show_round(rec)
 
     ended = ref.run(on_turn, lambda s: status.info(s), on_round)
-    status.info("The judge is reading the public record...")
-    judge = ref.judge(pooled=False)
-    pooled = None
-    if run_pooled:
-        status.info("Running the pooled baseline...")
-        pooled = ref.judge(pooled=True)
-    reading = None
-    if check_readings:
-        status.info("The judge is checking how each argument was read...")
-        reading = ref.check_readings()
-    graph = ref.declared_graph(support_rule)
+    res = ref.finish(run_pooled, lambda s: status.info(s))
     status.empty()
     st.session_state.last_run = {
         "app": APP_VERSION,
@@ -1858,10 +2480,15 @@ if st.button(f"▶ Run dialogue ({condition_label(strategy, policy)})", type="pr
         "transcript": ref.table,
         "goals": ref.goals,
         "first_shared": ref.first_shared,
-        "judge": judge,
-        "pooled": pooled,
-        "reading_check": reading,
-        "graph": graph,
+        "judge": res["judge"],
+        "pooled": res["pooled"],
+        "reading_check": res["reading_check"],
+        "closing": res["closing"],
+        "gold_plain": res["gold_plain"],
+        "trees": res["trees"],
+        "tree_check": res["tree_check"],
+        "proof_progress": res["proof_progress"],
+        "graph": res["graph"],
         "metrics": ref.metrics(),
         "usage": ref.usage,
     }
